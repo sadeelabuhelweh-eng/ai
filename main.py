@@ -1,19 +1,4 @@
-"""
-Graph Coloring via Simulated Annealing — Tkinter desktop version.
 
-Assignment 2 requirements covered:
-  1. Graph representation  -> GraphBench (adjacency list `self.edges`, click-to-build GUI)
-  2. Initial solution      -> random_hues(): random color per vertex from a chosen palette size
-  3. Simulated annealing   -> anneal_step()/heat_at(): configurable initial temperature,
-                              cooling schedule (geometric / linear / logarithmic), iteration budget
-  4. Output                -> final coloring drawn on the canvas + a vertex/color table +
-                              total conflict count
-
-Also supports loading a graph + SA parameters from an Excel file
-(graph_input.xlsx) via the "Load Excel" button, using pandas + openpyxl.
-That's the only extra dependency beyond the standard library — no
-scikit-learn, no matplotlib.
-"""
 
 import math
 import os
@@ -113,14 +98,6 @@ def heat_at(step, t0, rate, kind, total_steps):
     return t0 * (rate ** step)  # geometric
 
 
-# ===========================================================================
-# SECTION: GRAPH INPUT FROM EXCEL
-# Lets the graph (and the SA parameters) be loaded from graph_input.xlsx
-# instead of clicked in by hand. Plain parsing / graph construction with no
-# Tkinter in it, so it's reusable and easy to test on its own. Errors are
-# raised as ValueError with a human-readable message; the GUI layer
-# (App.on_load_excel_click) turns those into a messagebox.
-# ===========================================================================
 
 GRAPH_INPUT_FILE = "graph_input.xlsx"
 
@@ -245,7 +222,7 @@ class App(tk.Tk):
         super().__init__()
         self.title("Graph Coloring on the Annealing Bench")
         self.configure(bg=BG_PAPER)
-        self.geometry("1180x900")
+        self.geometry("1180x700")
 
         self.bench = GraphBench()
         self.mode = "sketch"
@@ -449,7 +426,7 @@ class App(tk.Tk):
         on_change(fire_command=False)
         return scale
 
-    # ---------------------------------------------------------- mode / bench events
+    #  mode / bench events
     MODE_CAPTIONS = {
         "sketch": "Click empty bench space to place a vertex.",
         "link": "Click one vertex, then a second, to connect or disconnect them.",
@@ -550,7 +527,6 @@ class App(tk.Tk):
             messagebox.showerror("Could not load Excel file", str(exc))
             return
 
-        # Stop any in-progress run before we swap the graph out from under it.
         if self.running:
             self.running = False
             if self.after_id:
@@ -560,10 +536,6 @@ class App(tk.Tk):
         self.bench = GraphBench()
         build_graph(self.bench, vertex_ids, edge_pairs)
 
-        # Load the SA parameters via their Scale widgets (rather than the
-        # tk variables directly) so each one's on-change callback — label
-        # text, swatch repaint, palette remap — fires exactly as it would
-        # if the user had dragged the slider by hand.
         self.k_scale.set(parameters["Number_of_Colors"])
         self.t0_scale.set(parameters["Initial_Temperature"])
         self.rate_scale.set(parameters["Cooling_Rate"])
@@ -590,7 +562,6 @@ class App(tk.Tk):
         self.note_label.config(text="Bench wiped. Sketch a fresh graph.")
         self._refresh_all()
 
-    # ---------------------------------------------------------- controls
     def on_palette_change(self):
         k = self.k_var.get()
         self._paint_swatches(k)
@@ -834,4 +805,5 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     app = App()
+    
     app.mainloop()
