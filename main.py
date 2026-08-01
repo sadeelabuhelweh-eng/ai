@@ -1,12 +1,44 @@
+"""
+Graph Coloring via Simulated Annealing — Tkinter desktop version.
 
+Assignment 2 requirements covered:
+  1. Graph representation  -> GraphBench (adjacency list `self.edges`, click-to-build GUI)
+  2. Initial solution      -> random_hues(): random color per vertex from a chosen palette size
+  3. Simulated annealing   -> anneal_step()/heat_at(): configurable initial temperature,
+                              cooling schedule (geometric / linear / logarithmic), iteration budget
+  4. Output                -> final coloring drawn on the canvas + a vertex/color table +
+                              total conflict count
+
+Also supports loading a graph + SA parameters from an Excel file
+(graph_input.xlsx) via the "Load Excel" button, using pandas + openpyxl.
+
+-------------------------------------------------------------------------------
+RESULTS-LOGGING + ANALYSIS EXTENSION (added on top of the above, nothing removed)
+-------------------------------------------------------------------------------
+Every completed annealing run is appended as one row to graph_results.xlsx
+(auto-incrementing Run_ID, persisted across restarts). Execution time is
+timed with Python's `time` module and shown in the GUI. A "Result Summary"
+popup appears after each run, an "Export Results" button lets you re-save
+the last run on demand, and an "Analyze Results" button opens a statistics
+window plus a separate window with matplotlib charts.
+
+Dependencies: tkinter, pandas, openpyxl, matplotlib, time (all standard
+library except pandas/openpyxl/matplotlib).
+"""
 
 import math
 import os
 import random
+import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 import pandas as pd
+
+import matplotlib
+matplotlib.use("TkAgg")  # embed figures inside Tkinter windows
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 INK_PALETTE = ["#a6392e", "#2f7d76", "#c98a2c", "#4a4e69", "#7a5c3e", "#3c3744"]
 COLOR_NAMES = ["Red", "Teal", "Amber", "Indigo", "Umber", "Charcoal"]
@@ -98,6 +130,14 @@ def heat_at(step, t0, rate, kind, total_steps):
     return t0 * (rate ** step)  # geometric
 
 
+# ===========================================================================
+# SECTION: GRAPH INPUT FROM EXCEL
+# Lets the graph (and the SA parameters) be loaded from graph_input.xlsx
+# instead of clicked in by hand. Plain parsing / graph construction with no
+# Tkinter in it, so it's reusable and easy to test on its own. Errors are
+# raised as ValueError with a human-readable message; the GUI layer
+# (App.on_load_excel_click) turns those into a messagebox.
+# ===========================================================================
 
 GRAPH_INPUT_FILE = "graph_input.xlsx"
 
@@ -217,12 +257,271 @@ def build_graph(bench, vertex_ids, edge_pairs, center_x=320, center_y=200, radiu
     return bench
 
 
+# ===========================================================================
+# SECTION 15: LOAD GRAPH FUNCTION
+# Thin wrapper so the project exposes a function literally named
+# `load_graph`, as requested. It does not duplicate any parsing logic — it
+# just calls the existing Excel-loading function. Excel support is
+# completely unchanged; this only adds an alternate name to call it by.
+# ===========================================================================
+
+def load_graph(source=GRAPH_INPUT_FILE):
+    """Load a graph from `source` (an Excel file path). Currently just
+    forwards to load_excel_graph(); kept separate so other sources could be
+    added later without touching load_excel_graph() itself.
+    Returns (vertex_ids, edge_pairs), same as load_excel_graph()."""
+    return load_excel_graph(source)
+
+
+# ===========================================================================
+# SECTION 8: DELTA FUNCTION
+# Computes the change in conflict count from recoloring a single vertex,
+# by looking only at that vertex's neighbors — never by rescanning every
+# edge in the graph. This is what makes each Simulated Annealing step cheap
+# even on larger graphs: conflicts are tracked incrementally instead of
+# being recounted from scratch after every proposed move.
+# ===========================================================================
+
+def build_adjacency(edges):
+    """Build an adjacency-list dict {vertex: set(neighbor_vertices)} from a
+    list of (a, b) edge tuples. Used by delta() / simulated_annealing()."""
+    adj = {}
+    for a, b in edges:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    return adj
+
+
+def delta(adj, coloring, vertex, old_color, new_color):
+    """Return (conflicts_after - conflicts_before) among the edges touching
+    `vertex`, if `vertex` were recolored from old_color to new_color.
+
+    adj      : {vertex: set(neighbor_vertices)}  (see build_adjacency)
+    coloring : {vertex: color_index}
+    vertex   : the vertex being considered for a recolor
+    old_color, new_color : its current and proposed color
+
+    Only `vertex`'s neighbors are inspected (O(degree)), so this never
+    touches — let alone recomputes — the rest of the graph.
+    """
+    neighbors = adj.get(vertex, ())
+    conflicts_before = sum(1 for nb in neighbors if coloring.get(nb) == old_color)
+    conflicts_after = sum(1 for nb in neighbors if coloring.get(nb) == new_color)
+    return conflicts_after - conflicts_before
+
+
+# ===========================================================================
+# SECTION 9: STANDARD SIMULATED ANNEALING FUNCTION
+# A standalone, non-GUI implementation of Simulated Annealing for graph
+# coloring with exactly the requested signature. It's independent of the
+# animated Tkinter loop (App.anneal_step / App._loop_tick), which keeps its
+# own working step-by-step version untouched for the live GUI. This
+# function is for running SA to completion in one call, e.g. for testing,
+# scripting, or grading, and it uses delta() internally so it never
+# recomputes the whole graph's conflicts either.
+# ===========================================================================
+
+def simulated_annealing(adj, k, T0, alpha, iters_per_temp, Tmin):
+    """Run Simulated Annealing to color the graph described by `adj`.
+
+    adj             : {vertex: set(neighbor_vertices)}  (see build_adjacency)
+    k               : number of colors available
+    T0              : starting temperature
+    alpha           : cooling factor applied after each temperature level (0 < alpha < 1)
+    iters_per_temp  : number of proposed moves attempted at each temperature
+    Tmin            : temperature at which the search stops
+
+    Returns (best_coloring, best_cost) where best_cost is the number of
+    conflicting edges in best_coloring.
+    """
+    vertices = list(adj.keys())
+    if not vertices:
+        return {}, 0
+
+    # Initial solution: a random color per vertex (mirrors random_hues()).
+    coloring = {v: random.randrange(k) for v in vertices}
+
+    # Total conflicts is only ever computed in full ONCE, right here, for the
+    # starting coloring. From this point on it's maintained incrementally
+    # via delta(), never recounted from scratch. Each conflicting edge is
+    # seen from both of its endpoints, hence the // 2.
+    current_cost = sum(1 for v in vertices for nb in adj[v] if coloring[v] == coloring[nb]) // 2
+
+    best_coloring = dict(coloring)
+    best_cost = current_cost
+
+    T = T0
+    while T > Tmin:
+        for _ in range(iters_per_temp):
+            v = random.choice(vertices)
+            old_color = coloring[v]
+            new_color = random.randrange(k)
+            if k > 1:
+                while new_color == old_color:
+                    new_color = random.randrange(k)
+
+            # SECTION 8 in action: get the conflict change for just this one
+            # proposed move, in O(degree(v)) time.
+            change = delta(adj, coloring, v, old_color, new_color)
+
+            # -----------------------------------------------------------------
+            # SECTION 10: ACCEPTANCE RULE
+            # A move that doesn't make things worse (change <= 0) is always
+            # accepted — it's a free improvement or a sideways move.
+            # A move that WOULD make things worse can still be accepted, with
+            # probability:
+            #
+            #     P = exp(-ΔE / T)      (ΔE = `change` here)
+            #
+            # This is the key idea of Simulated Annealing: a purely greedy
+            # search (always reject worse moves) gets permanently stuck the
+            # first time every neighboring move looks worse — a "local
+            # minimum" — even if a better solution exists a few moves away.
+            # Occasionally accepting a worse move lets the search climb back
+            # out of that dip and keep exploring. When T is large, P is close
+            # to 1, so almost any move is accepted (broad exploration). As T
+            # shrinks, P shrinks too, so worse moves become rare.
+            # -----------------------------------------------------------------
+            accept = change <= 0 or random.random() < math.exp(-change / max(T, 1e-9))
+            if accept:
+                coloring[v] = new_color
+                current_cost += change
+                if current_cost < best_cost:
+                    best_cost = current_cost
+                    best_coloring = dict(coloring)
+
+        # -----------------------------------------------------------------
+        # SECTION 11: COOLING LOOP
+        # After each batch of `iters_per_temp` attempted moves, the
+        # temperature is reduced by a constant factor (geometric/exponential
+        # cooling): T = T * alpha, with alpha < 1. Lower T shrinks the
+        # acceptance probability P = exp(-ΔE/T) for worse moves, so the
+        # search gradually shifts from broad, loose exploration (hot, early)
+        # to a focused, greedy local search (cool, late) — mirroring the
+        # metallurgical annealing process this algorithm is named after:
+        # start hot and malleable, finish cool and settled into place.
+        # -----------------------------------------------------------------
+        T *= alpha
+
+    return best_coloring, best_cost
+
+
+# ===========================================================================
+# SECTION 1: SAVE RESULTS TO EXCEL
+# Every completed annealing run is appended as one row to graph_results.xlsx.
+# The file is created (with these exact columns) the first time a run is
+# saved; every time after that, existing rows are loaded and the new row is
+# appended underneath — nothing already in the file is overwritten.
+# ===========================================================================
+
+RESULTS_FILE = "graph_results.xlsx"
+
+RESULT_COLUMNS = [
+    "Run_ID", "Date", "Time", "Number_of_Vertices", "Number_of_Edges",
+    "Number_of_Colors", "Initial_Temperature", "Cooling_Rate", "Iterations",
+    "Initial_Conflicts", "Final_Conflicts", "Execution_Time_ms", "Success",
+]
+
+
+def append_result_row(record, filename=RESULTS_FILE):
+    """Append one already-built result row (a dict with every RESULT_COLUMNS
+    key, including Run_ID) to the results workbook, creating it if needed."""
+    if os.path.exists(filename):
+        existing = pd.read_excel(filename, engine="openpyxl")
+    else:
+        existing = pd.DataFrame(columns=RESULT_COLUMNS)
+
+    updated = pd.concat([existing, pd.DataFrame([record])], ignore_index=True)
+    updated = updated[RESULT_COLUMNS]  # keep a stable, predictable column order
+    updated.to_excel(filename, index=False, engine="openpyxl")
+
+
+# ===========================================================================
+# SECTION 3: AUTOMATIC RUN ID
+# Run_ID keeps counting up across restarts by checking what's already in
+# graph_results.xlsx, rather than starting over from 1 every time the
+# program launches.
+# ===========================================================================
+
+def get_next_run_id(filename=RESULTS_FILE):
+    """Return the next Run_ID: (max existing Run_ID in the file) + 1, or 1
+    if the file doesn't exist yet / has no rows."""
+    if not os.path.exists(filename):
+        return 1
+    try:
+        existing = pd.read_excel(filename, engine="openpyxl")
+    except Exception:
+        return 1
+    if len(existing) == 0 or "Run_ID" not in existing.columns:
+        return 1
+    return int(existing["Run_ID"].max()) + 1
+
+
+# ===========================================================================
+# SECTION 6: STATISTICS
+# Reads graph_results.xlsx and computes the summary numbers shown in the
+# "Analyze Results" statistics window.
+# ===========================================================================
+
+def load_results(filename=RESULTS_FILE):
+    """Load the collected runs into a pandas DataFrame."""
+    return pd.read_excel(filename, engine="openpyxl")
+
+
+def compute_statistics(df):
+    """Return a dict of the summary statistics for the Analyze Results window."""
+    best_row = df.loc[df["Final_Conflicts"].idxmin()]
+    worst_row = df.loc[df["Final_Conflicts"].idxmax()]
+    return {
+        "total_runs": len(df),
+        "avg_final_conflicts": df["Final_Conflicts"].mean(),
+        "min_final_conflicts": df["Final_Conflicts"].min(),
+        "max_final_conflicts": df["Final_Conflicts"].max(),
+        "avg_execution_time_ms": df["Execution_Time_ms"].mean(),
+        "success_rate_pct": df["Success"].mean() * 100,
+        "best_run_id": int(best_row["Run_ID"]),
+        "worst_run_id": int(worst_row["Run_ID"]),
+    }
+
+
+# ===========================================================================
+# SECTION 7: CHARTS
+# One matplotlib Figure with all three requested charts, ready to be
+# embedded in a Tkinter window.
+# ===========================================================================
+
+def build_charts_figure(df):
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+    fig.suptitle("Graph Coloring SA — Results Charts", fontsize=12, fontweight="bold")
+
+    # Line chart: Final Conflicts vs Run ID
+    axes[0].plot(df["Run_ID"], df["Final_Conflicts"], color=DANGER, marker="o", markersize=3)
+    axes[0].set_title("Final Conflicts vs Run ID")
+    axes[0].set_xlabel("Run ID")
+    axes[0].set_ylabel("Final Conflicts")
+
+    # Line chart: Execution Time vs Run ID
+    axes[1].plot(df["Run_ID"], df["Execution_Time_ms"], color="#c98a2c", marker="o", markersize=3)
+    axes[1].set_title("Execution Time vs Run ID")
+    axes[1].set_xlabel("Run ID")
+    axes[1].set_ylabel("Execution Time (ms)")
+
+    # Bar chart: Success vs Failure
+    counts = df["Success"].value_counts().reindex([0, 1], fill_value=0)
+    axes[2].bar(["Failure", "Success"], counts.values, color=[DANGER, TEAL])
+    axes[2].set_title("Success vs Failure")
+    axes[2].set_ylabel("Count")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    return fig
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Graph Coloring on the Annealing Bench")
         self.configure(bg=BG_PAPER)
-        self.geometry("1180x700")
+        self.geometry("1180x900")
 
         self.bench = GraphBench()
         self.mode = "sketch"
@@ -241,13 +540,75 @@ class App(tk.Tk):
         self.history = []   # list of (step, cur, best)
         self.after_id = None
 
+        # SECTION 8: cached adjacency dict {vertex: set(neighbors)}, built
+        # lazily from self.bench.edges and reused across many anneal_step()
+        # calls so delta() never has to rescan the whole edge list. Any
+        # graph-structure edit sets this back to None so it's rebuilt fresh
+        # next time it's needed (see _get_adjacency()).
+        self._adj = None
+
+        # Results-logging state: captured once at the start of a fresh run,
+        # consumed once the run completes and its row is saved.
+        self._run_start_meta = None
+        self._run_start_time = None
+        self._last_run_record = None  # most recently saved row, for "Export Results"
+
         self._build_ui()
         self._bind_bench_events()
         self._refresh_all()
 
     # ---------------------------------------------------------- UI building
     def _build_ui(self):
-        header = tk.Frame(self, bg=BG_CARD, highlightbackground=INK, highlightthickness=1)
+        # ------------------------------------------------------------------
+        # SCROLLABLE CONTAINER
+        # Everything below (header, bench/controls, log/stats) is packed
+        # into `self.scroll_frame`, which sits inside a Canvas + Scrollbar
+        # instead of directly on the window. That's what makes the window
+        # scrollable when its content is taller than the visible area
+        # (e.g. on a smaller screen) — plain tk.Frame/pack on the root
+        # window has no scrolling of its own, so without this wrapper
+        # anything below the fold was simply unreachable.
+        # ------------------------------------------------------------------
+        outer = tk.Frame(self, bg=BG_PAPER)
+        outer.pack(fill="both", expand=True)
+
+        self.main_canvas = tk.Canvas(outer, bg=BG_PAPER, highlightthickness=0)
+        v_scroll = ttk.Scrollbar(outer, orient="vertical", command=self.main_canvas.yview)
+        self.main_canvas.configure(yscrollcommand=v_scroll.set)
+        self.main_canvas.pack(side="left", fill="both", expand=True)
+        v_scroll.pack(side="right", fill="y")
+
+        self.scroll_frame = tk.Frame(self.main_canvas, bg=BG_PAPER)
+        self._scroll_window = self.main_canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
+
+        # Keep the scrollable area's height in sync with its actual content,
+        # and keep the inner frame's width matched to the canvas so it
+        # doesn't get needlessly wide or clipped as the window is resized.
+        self.scroll_frame.bind(
+            "<Configure>",
+            lambda e: self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all")),
+        )
+        self.main_canvas.bind(
+            "<Configure>",
+            lambda e: self.main_canvas.itemconfigure(self._scroll_window, width=e.width),
+        )
+
+        # Mouse-wheel scrolling: Windows/macOS send <MouseWheel>, Linux
+        # sends <Button-4>/<Button-5>. Bound on the canvas so it works
+        # anywhere the pointer is over the window.
+        def _on_mousewheel(event):
+            if event.num == 4:
+                self.main_canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                self.main_canvas.yview_scroll(1, "units")
+            else:
+                self.main_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        self.main_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        self.main_canvas.bind_all("<Button-4>", _on_mousewheel)
+        self.main_canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        header = tk.Frame(self.scroll_frame, bg=BG_CARD, highlightbackground=INK, highlightthickness=1)
         header.pack(fill="x", padx=16, pady=(14, 10))
         tk.Label(header, text="Graph Coloring on the Annealing Bench", bg=BG_CARD, fg=INK,
                  font=("Georgia", 18, "bold")).pack(anchor="w", padx=14, pady=(10, 2))
@@ -258,7 +619,7 @@ class App(tk.Tk):
             bg=BG_CARD, fg=INK_SOFT, font=("Courier New", 10), wraplength=1000, justify="left",
         ).pack(anchor="w", padx=14, pady=(0, 10))
 
-        top = tk.Frame(self, bg=BG_PAPER)
+        top = tk.Frame(self.scroll_frame, bg=BG_PAPER)
         top.pack(fill="both", expand=False, padx=16)
         top.columnconfigure(0, weight=3)
         top.columnconfigure(1, weight=2)
@@ -337,8 +698,18 @@ class App(tk.Tk):
                   bg=BG_PAPER, fg=INK, relief="solid", bd=1, font=("Courier New", 10, "bold")
                   ).pack(side="left", fill="x", expand=True)
 
+        # ---- Results-logging row: Export Results / Analyze Results ----
+        results_row = tk.Frame(ctrl_card, bg=BG_CARD)
+        results_row.pack(fill="x", pady=(8, 0))
+        tk.Button(results_row, text="Export Results", command=self.on_export_results_click,
+                  bg=BG_PAPER, fg=INK, relief="solid", bd=1, font=("Courier New", 10, "bold")
+                  ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        tk.Button(results_row, text="Analyze Results", command=self.on_analyze_results_click,
+                  bg=INDIGO, fg="white", relief="solid", bd=1, font=("Courier New", 10, "bold")
+                  ).pack(side="left", fill="x", expand=True)
+
         # ---- Bottom row: log + stats ----
-        bottom = tk.Frame(self, bg=BG_PAPER)
+        bottom = tk.Frame(self.scroll_frame, bg=BG_PAPER)
         bottom.pack(fill="both", expand=True, padx=16, pady=(10, 16))
         bottom.columnconfigure(0, weight=3)
         bottom.columnconfigure(1, weight=2)
@@ -373,15 +744,20 @@ class App(tk.Tk):
         tiles = tk.Frame(stats_card, bg=BG_CARD)
         tiles.pack(fill="x", pady=(0, 10))
         cur_tile = tk.Frame(tiles, bg=BG_CANVAS, highlightbackground=INK, highlightthickness=1)
-        cur_tile.pack(side="left", fill="x", expand=True, padx=(0, 5))
+        cur_tile.pack(side="left", fill="x", expand=True, padx=(0, 4))
         tk.Label(cur_tile, text="LIVE CLASHES", bg=BG_CANVAS, fg=INK_SOFT, font=("Courier New", 8)).pack(anchor="w", padx=8, pady=(6, 0))
         self.cur_tile_val = tk.Label(cur_tile, text="\u2013", bg=BG_CANVAS, fg=DANGER, font=("Georgia", 16, "bold"))
         self.cur_tile_val.pack(anchor="w", padx=8, pady=(0, 6))
         best_tile = tk.Frame(tiles, bg=BG_CANVAS, highlightbackground=INK, highlightthickness=1)
-        best_tile.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        best_tile.pack(side="left", fill="x", expand=True, padx=4)
         tk.Label(best_tile, text="BEST FOUND", bg=BG_CANVAS, fg=INK_SOFT, font=("Courier New", 8)).pack(anchor="w", padx=8, pady=(6, 0))
         self.best_tile_val = tk.Label(best_tile, text="\u2013", bg=BG_CANVAS, fg=TEAL, font=("Georgia", 16, "bold"))
         self.best_tile_val.pack(anchor="w", padx=8, pady=(0, 6))
+        exec_tile = tk.Frame(tiles, bg=BG_CANVAS, highlightbackground=INK, highlightthickness=1)
+        exec_tile.pack(side="left", fill="x", expand=True, padx=(4, 0))
+        tk.Label(exec_tile, text="EXEC TIME (MS)", bg=BG_CANVAS, fg=INK_SOFT, font=("Courier New", 8)).pack(anchor="w", padx=8, pady=(6, 0))
+        self.exec_time_val = tk.Label(exec_tile, text="\u2013", bg=BG_CANVAS, fg=INDIGO, font=("Georgia", 16, "bold"))
+        self.exec_time_val.pack(anchor="w", padx=8, pady=(0, 6))
 
         table_frame = tk.Frame(stats_card, bg=BG_CANVAS, highlightbackground=INK, highlightthickness=1)
         table_frame.pack(fill="both", expand=True, pady=(0, 8))
@@ -426,7 +802,7 @@ class App(tk.Tk):
         on_change(fire_command=False)
         return scale
 
-    #  mode / bench events
+    # ---------------------------------------------------------- mode / bench events
     MODE_CAPTIONS = {
         "sketch": "Click empty bench space to place a vertex.",
         "link": "Click one vertex, then a second, to connect or disconnect them.",
@@ -462,6 +838,7 @@ class App(tk.Tk):
                 vid = self.bench.add_vertex(x, y)
                 if self.bench.hues:
                     self.bench.hues[vid] = random.randrange(self.k_var.get())
+                self._adj = None  # SECTION 8: graph changed, adjacency stale
                 self._refresh_all()
 
         elif self.mode == "link":
@@ -471,6 +848,7 @@ class App(tk.Tk):
                 elif self.pending_link != hit["id"]:
                     self.bench.toggle_edge(self.pending_link, hit["id"])
                     self.pending_link = None
+                self._adj = None  # SECTION 8: edges changed, adjacency stale
                 self._refresh_all()
 
         elif self.mode == "shift":
@@ -482,6 +860,7 @@ class App(tk.Tk):
                 self.bench.remove_vertex(hit["id"])
             else:
                 self.bench.remove_edge_near(x, y)
+            self._adj = None  # SECTION 8: graph changed, adjacency stale
             self._refresh_all()
 
     def _on_bench_drag(self, event):
@@ -507,6 +886,7 @@ class App(tk.Tk):
         self.best_hues = dict(self.bench.hues)
         self.history = [(0, self.best_clashes, self.best_clashes)]
         self.tick = 0
+        self._adj = None  # SECTION 8: fresh graph, adjacency stale
         self.note_label.config(text="Sample loaded — a hub-and-rim graph. Light the burner when ready.")
         self._refresh_all()
 
@@ -527,6 +907,7 @@ class App(tk.Tk):
             messagebox.showerror("Could not load Excel file", str(exc))
             return
 
+        # Stop any in-progress run before we swap the graph out from under it.
         if self.running:
             self.running = False
             if self.after_id:
@@ -536,6 +917,10 @@ class App(tk.Tk):
         self.bench = GraphBench()
         build_graph(self.bench, vertex_ids, edge_pairs)
 
+        # Load the SA parameters via their Scale widgets (rather than the
+        # tk variables directly) so each one's on-change callback — label
+        # text, swatch repaint, palette remap — fires exactly as it would
+        # if the user had dragged the slider by hand.
         self.k_scale.set(parameters["Number_of_Colors"])
         self.t0_scale.set(parameters["Initial_Temperature"])
         self.rate_scale.set(parameters["Cooling_Rate"])
@@ -547,6 +932,7 @@ class App(tk.Tk):
         self.history = [(0, self.best_clashes, self.best_clashes)]
         self.tick = 0
         self.heat = self.t0_var.get()
+        self._adj = None  # SECTION 8: fresh graph, adjacency stale
 
         self.note_label.config(
             text=f"Loaded {len(vertex_ids)} vertices / {len(self.bench.edges)} edges "
@@ -559,9 +945,11 @@ class App(tk.Tk):
         self.best_hues = None
         self.history = []
         self.tick = 0
+        self._adj = None  # SECTION 8: bench cleared, adjacency stale
         self.note_label.config(text="Bench wiped. Sketch a fresh graph.")
         self._refresh_all()
 
+    # ---------------------------------------------------------- controls
     def on_palette_change(self):
         k = self.k_var.get()
         self._paint_swatches(k)
@@ -617,6 +1005,15 @@ class App(tk.Tk):
             "budget": self.budget_var.get(),
         }
 
+    def _get_adjacency(self):
+        """SECTION 8: return the cached adjacency dict, building it from
+        self.bench.edges the first time it's needed (or after any graph
+        edit sets self._adj back to None). Reused across every anneal_step()
+        call in a run so delta() never has to rescan the edge list."""
+        if self._adj is None:
+            self._adj = build_adjacency(self.bench.edges)
+        return self._adj
+
     def anneal_step(self):
         n = len(self.bench.vertices)
         if n == 0:
@@ -642,23 +1039,31 @@ class App(tk.Tk):
             while new_hue == old_hue:
                 new_hue = random.randrange(k)
 
-        before = after = 0
-        for a, b in self.bench.edges:
-            if a == chosen["id"] or b == chosen["id"]:
-                other = self.bench.hues.get(b if a == chosen["id"] else a)
-                if other == old_hue:
-                    before += 1
-                if other == new_hue:
-                    after += 1
-        delta = after - before
-        accept = delta <= 0
+        # SECTION 8: get the conflict change for this one proposed move by
+        # looking only at chosen vertex's neighbors (via the cached
+        # adjacency dict), instead of rescanning every edge in the graph.
+        # Numerically identical to the old inline before/after edge scan —
+        # just factored into the reusable delta() function.
+        adj = self._get_adjacency()
+        change = delta(adj, self.bench.hues, chosen["id"], old_hue, new_hue)
+
+        # ---- Acceptance rule (see SECTION 10 in simulated_annealing() for
+        # the full explanation): a move that doesn't increase conflicts is
+        # always taken; a worse move is still taken sometimes, with
+        # probability exp(-change / T), which is what lets the search
+        # escape local minima instead of getting stuck. ----
+        accept = change <= 0
         if not accept:
-            accept = random.random() < math.exp(-delta / max(self.heat, 1e-6))
+            accept = random.random() < math.exp(-change / max(self.heat, 1e-6))
         if accept:
             self.bench.hues[chosen["id"]] = new_hue
 
         self.tick += 1
         p = self._live_params()
+        # ---- Cooling schedule (see SECTION 11): heat_at() reduces the
+        # temperature as `tick` grows, using whichever schedule is selected
+        # (geometric/linear/log). Lower temperature -> smaller acceptance
+        # probability above -> the search gets progressively greedier. ----
         self.heat = heat_at(self.tick, p["t0"], p["rate"], p["schedule"], p["budget"])
 
         cur = self.bench.clash_count()
@@ -690,12 +1095,32 @@ class App(tk.Tk):
             # rate / schedule / step budget are read live each step (see
             # _live_params) so they don't need to be captured here.
 
+            # --- SECTION 2/3 hook: start timing this run and snapshot
+            # everything needed for the results row that gets saved once it
+            # finishes (see _record_completed_run in _loop_tick below). ---
+            self._run_start_time = time.perf_counter()
+            self._run_start_meta = {
+                "n_vertices": len(self.bench.vertices),
+                "n_edges": len(self.bench.edges),
+                "n_colors": self.k_var.get(),
+                "t0": self.t0_var.get(),
+                "rate": self.rate_var.get(),
+                "initial_conflicts": self.best_clashes,
+            }
+
         self.running = True
         self.go_button.config(text="Pause")
         self.note_label.config(text="Annealing under way — watch the thermometer and the lab log.")
         self._loop_tick()
 
     def _loop_tick(self):
+        """SECTION 13: LIVE ANIMATION — this runs a small chunk of
+        annealing steps (`per_frame` of them), redraws, then reschedules
+        itself with self.after(...) instead of looping straight through to
+        completion. That keeps control returning to Tkinter's event loop
+        between chunks, so the window stays responsive and the graph
+        visibly updates chunk by chunk instead of the GUI blocking/freezing
+        until the whole run is done."""
         if not self.running:
             return
         per_frame = self.frame_var.get()
@@ -707,6 +1132,11 @@ class App(tk.Tk):
             cur = self.anneal_step()
             budget_now = self._live_params()["budget"]
 
+        # SECTION 14: DISPLAY CURRENT STATUS — _refresh_all() below updates
+        # the thermometer (current temperature), the step label (current
+        # iteration / budget), and the live/best clash tiles every single
+        # frame, so all four values stay current while the run is in
+        # progress, not just once at the end.
         self._refresh_all(cur)
 
         if self.tick >= budget_now:
@@ -718,9 +1148,148 @@ class App(tk.Tk):
             plural = "" if self.best_clashes == 1 else "es"
             self.note_label.config(
                 text=f"Burner out. Best coloring applied: {self.best_clashes} clash{plural} across {n_edges} links.")
+            self._record_completed_run()
             return
 
+        # SECTION 13: schedule the next chunk via Tkinter's event loop
+        # (root.after) rather than blocking with a plain while-loop.
         self.after_id = self.after(16, self._loop_tick)
+
+    # ---------------------------------------------------------- SECTION 1/2/3/4/5: results logging
+    def _build_result_record(self):
+        """Build the full result row dict for the run that just finished."""
+        meta = self._run_start_meta
+        elapsed_ms = (time.perf_counter() - self._run_start_time) * 1000.0
+        now = time.localtime()
+        return {
+            "Run_ID": get_next_run_id(),
+            "Date": time.strftime("%Y-%m-%d", now),
+            "Time": time.strftime("%H:%M:%S", now),
+            "Number_of_Vertices": meta["n_vertices"],
+            "Number_of_Edges": meta["n_edges"],
+            "Number_of_Colors": meta["n_colors"],
+            "Initial_Temperature": meta["t0"],
+            "Cooling_Rate": meta["rate"],
+            "Iterations": self.tick,
+            "Initial_Conflicts": meta["initial_conflicts"],
+            "Final_Conflicts": self.best_clashes,
+            "Execution_Time_ms": round(elapsed_ms, 3),
+            "Success": 1 if self.best_clashes == 0 else 0,
+        }
+
+    def _record_completed_run(self):
+        """SECTION 1/2/3/5: save this run's row to graph_results.xlsx, show
+        the execution time in the GUI, and pop up the result summary.
+        No-op if no fresh run was actually started (guards against
+        double-logging if the button is pressed again afterwards)."""
+        if self._run_start_meta is None:
+            return
+
+        record = self._build_result_record()
+        try:
+            append_result_row(record)
+        except Exception as exc:
+            messagebox.showerror("Save error", f"Could not save the run to {RESULTS_FILE}:\n{exc}")
+            self._run_start_meta = None
+            return
+
+        self._last_run_record = record
+        self._run_start_meta = None  # consumed
+
+        # SECTION 2: show execution time in the GUI
+        self.exec_time_val.config(text=f"{record['Execution_Time_ms']:.1f}")
+
+        # SECTION 5: result summary popup
+        outcome = "SUCCESS" if record["Success"] == 1 else "FAILURE"
+        messagebox.showinfo(
+            "Algorithm Finished",
+            "Algorithm Finished\n\n"
+            f"Run ID: {record['Run_ID']}\n"
+            f"Execution Time: {record['Execution_Time_ms']:.1f} ms\n"
+            f"Initial Conflicts: {record['Initial_Conflicts']}\n"
+            f"Final Conflicts: {record['Final_Conflicts']}\n"
+            f"Result: {outcome}",
+        )
+
+    # ---------------------------------------------------------- SECTION 4: export results
+    def on_export_results_click(self):
+        """'Export Results' button: manually (re-)save the most recently
+        completed run to graph_results.xlsx, assigning it a fresh Run_ID.
+        Useful to explicitly confirm/update the file on demand."""
+        if self._last_run_record is None:
+            messagebox.showinfo(
+                "Nothing to export",
+                "No completed run yet this session. Run the algorithm at least once first.")
+            return
+
+        record = dict(self._last_run_record)
+        record["Run_ID"] = get_next_run_id()
+        now = time.localtime()
+        record["Date"] = time.strftime("%Y-%m-%d", now)
+        record["Time"] = time.strftime("%H:%M:%S", now)
+        try:
+            append_result_row(record)
+        except Exception as exc:
+            messagebox.showerror("Export error", f"Could not update {RESULTS_FILE}:\n{exc}")
+            return
+
+        self._last_run_record = record
+        messagebox.showinfo("Exported", f"Saved as Run_ID {record['Run_ID']} in {RESULTS_FILE}.")
+
+    # ---------------------------------------------------------- SECTION 6/7: analyze results
+    def on_analyze_results_click(self):
+        """'Analyze Results' button: load graph_results.xlsx, show a
+        statistics window, and open a separate window with the charts."""
+        if not os.path.exists(RESULTS_FILE):
+            messagebox.showwarning(
+                "No data yet",
+                f"No {RESULTS_FILE} file found.\nRun the annealer to completion a few times first.")
+            return
+        try:
+            df = load_results()
+        except Exception as exc:
+            messagebox.showerror("Load error", f"Could not read {RESULTS_FILE}:\n{exc}")
+            return
+        if len(df) == 0:
+            messagebox.showwarning("No data yet", f"{RESULTS_FILE} has no runs recorded yet.")
+            return
+
+        stats = compute_statistics(df)
+        self._show_statistics_window(stats, len(df))
+        self._show_charts_window(df)
+
+    def _show_statistics_window(self, stats, total_runs):
+        win = tk.Toplevel(self)
+        win.title("Statistics")
+        win.configure(bg=BG_PAPER)
+
+        text = (
+            f"Total Runs:              {stats['total_runs']}\n"
+            f"Average Final Conflicts: {stats['avg_final_conflicts']:.2f}\n"
+            f"Minimum Final Conflicts: {stats['min_final_conflicts']}\n"
+            f"Maximum Final Conflicts: {stats['max_final_conflicts']}\n"
+            f"Average Execution Time: {stats['avg_execution_time_ms']:.2f} ms\n"
+            f"Success Rate:            {stats['success_rate_pct']:.1f}%\n"
+            f"Best Run ID:             {stats['best_run_id']}\n"
+            f"Worst Run ID:            {stats['worst_run_id']}\n"
+        )
+        tk.Label(win, text="Statistics", bg=BG_PAPER, fg=INDIGO, font=("Georgia", 14, "bold")
+                 ).pack(anchor="w", padx=16, pady=(14, 4))
+        tk.Label(win, text=text, justify="left", anchor="w", bg=BG_CARD, fg=INK,
+                 font=("Courier New", 11), padx=14, pady=12,
+                 highlightbackground=INK, highlightthickness=1).pack(fill="both", expand=True, padx=16, pady=(0, 16))
+
+    def _show_charts_window(self, df):
+        win = tk.Toplevel(self)
+        win.title("Charts")
+        win.configure(bg=BG_PAPER)
+
+        fig = build_charts_figure(df)
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=(10, 4))
+        toolbar = NavigationToolbar2Tk(canvas, win)
+        toolbar.update()
 
     # ---------------------------------------------------------- drawing
     def _refresh_all(self, cur_override=None):
@@ -739,6 +1308,13 @@ class App(tk.Tk):
             vb = next((v for v in self.bench.vertices if v["id"] == b), None)
             if not va or not vb:
                 continue
+            # SECTION 12: CONFLICT EDGE HIGHLIGHTING — an edge whose two
+            # endpoints currently share the same color is drawn in DANGER
+            # red and thicker; every other edge stays the normal muted
+            # color. draw_bench() runs on every redraw (including every
+            # animation frame while a run is in progress — see SECTION 13),
+            # so this highlighting is always live/current, not just a
+            # one-time snapshot.
             clash = a in self.bench.hues and self.bench.hues.get(a) == self.bench.hues.get(b)
             c.create_line(va["x"], va["y"], vb["x"], vb["y"],
                           fill=(DANGER if clash else "#a89a89"), width=(3 if clash else 1.4))
@@ -805,5 +1381,4 @@ class App(tk.Tk):
 
 if __name__ == "__main__":
     app = App()
-    
     app.mainloop()
